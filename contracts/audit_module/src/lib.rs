@@ -53,6 +53,8 @@ pub enum AuditError {
     InvalidChallenge = 17,
     /// The supplied export has no integrity marker (all-zero) and cannot be verified.
     IntegrityMarkerMissing = 18,
+    /// An audit event sequence violation was detected (Issue #701).
+    InvalidEventSequence = 19,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +84,18 @@ pub enum AuditScope {
     TimeRange = 1,
     EmployeeList = 2,
     AggregateOnly = 3,
+}
+
+/// Lifecycle stage of an auditor's view-key grant.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AuditLifecycleStage {
+    None = 0,
+    Granted = 1,
+    Active = 2,
+    Revoked = 3,
+    Pruned = 4,
 }
 
 /// An audit log entry written each time an auditor performs a verification
@@ -163,6 +177,8 @@ pub enum DataKey {
     AuditLog(Symbol, u32),
     /// Pause manager address (issue #167).
     PauseManager,
+    /// Tracks an auditor's lifecycle stage (Issue #701).
+    AuditLifecycle(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +241,9 @@ impl AuditModule {
         env.storage()
             .persistent()
             .set(&DataKey::AuditorKey(auditor.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Granted);
 
         payroll_events::emit_view_key_generated(&env, auditor, expiration_ledger);
 
@@ -286,6 +305,9 @@ impl AuditModule {
         env.storage()
             .persistent()
             .remove(&DataKey::AuditorKey(auditor.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Revoked);
 
         payroll_events::emit_audit_access_revoked(&env, admin, auditor);
 
@@ -320,8 +342,90 @@ impl AuditModule {
         env.storage()
             .persistent()
             .remove(&DataKey::AuditorKey(auditor.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Pruned);
         payroll_events::emit_audit_grant_pruned(&env, admin, auditor);
         Ok(())
+    }
+
+    /// Returns the current lifecycle stage of an auditor (Issue #701).
+    pub fn get_audit_lifecycle_stage(env: Env, auditor: Address) -> AuditLifecycleStage {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuditLifecycle(auditor))
+            .unwrap_or(AuditLifecycleStage::None)
+    }
+
+    /// Verifies that a sequence of audit event topic symbols follows the canonical
+    /// lifecycle sequence (Issue #701):
+    ///
+    /// 1. Initialization: Must begin with `ViewKeyGenerated`.
+    /// 2. Active Operations: `ViewKeyRefreshed`, `AuditSuccessful`, `MetadataVerified`,
+    ///    `MetadataMismatch`, `AggregateAuditGenerated`, `AuditSummaryExported`.
+    /// 3. Termination: `AuditAccessExpired` or `AuditAccessRevoked`.
+    /// 4. Cleanup: `AuditGrantPruned` (only valid after termination).
+    ///
+    /// Returns `Ok(true)` if sequence is valid, or `Err(AuditError::InvalidEventSequence)`
+    /// if out of order, empty, or improperly terminated.
+    pub fn verify_audit_event_sequence(env: Env, event_names: Vec<Symbol>) -> Result<bool, AuditError> {
+        if event_names.is_empty() {
+            return Err(AuditError::InvalidEventSequence);
+        }
+
+        let sym_generated = Symbol::new(&env, "ViewKeyGenerated");
+        let sym_refreshed = Symbol::new(&env, "ViewKeyRefreshed");
+        let sym_audit_ok = Symbol::new(&env, "AuditSuccessful");
+        let sym_meta_ok = Symbol::new(&env, "MetadataVerified");
+        let sym_meta_mismatch = Symbol::new(&env, "MetadataMismatch");
+        let sym_agg_gen = Symbol::new(&env, "AggregateAuditGenerated");
+        let sym_summary_exp = Symbol::new(&env, "AuditSummaryExported");
+        let sym_expired = Symbol::new(&env, "AuditAccessExpired");
+        let sym_revoked = Symbol::new(&env, "AuditAccessRevoked");
+        let sym_pruned = Symbol::new(&env, "AuditGrantPruned");
+
+        if event_names.get(0).unwrap() != sym_generated {
+            return Err(AuditError::InvalidEventSequence);
+        }
+
+        let mut stage = AuditLifecycleStage::Granted;
+        let mut has_terminated = false;
+
+        for i in 1..event_names.len() {
+            let event = event_names.get(i).unwrap();
+
+            if stage == AuditLifecycleStage::Pruned {
+                return Err(AuditError::InvalidEventSequence);
+            }
+
+            if event == sym_refreshed
+                || event == sym_audit_ok
+                || event == sym_meta_ok
+                || event == sym_meta_mismatch
+                || event == sym_agg_gen
+                || event == sym_summary_exp
+            {
+                if has_terminated || stage == AuditLifecycleStage::Revoked || stage == AuditLifecycleStage::Pruned {
+                    return Err(AuditError::InvalidEventSequence);
+                }
+                stage = AuditLifecycleStage::Active;
+            } else if event == sym_expired || event == sym_revoked {
+                if has_terminated || stage == AuditLifecycleStage::Revoked || stage == AuditLifecycleStage::Pruned {
+                    return Err(AuditError::InvalidEventSequence);
+                }
+                stage = AuditLifecycleStage::Revoked;
+                has_terminated = true;
+            } else if event == sym_pruned {
+                if !has_terminated && stage != AuditLifecycleStage::Revoked {
+                    return Err(AuditError::InvalidEventSequence);
+                }
+                stage = AuditLifecycleStage::Pruned;
+            } else {
+                return Err(AuditError::InvalidEventSequence);
+            }
+        }
+
+        Ok(true)
     }
 
     pub fn get_view_key(env: Env, auditor: Address) -> Result<ViewKeyRecord, AuditError> {
@@ -398,6 +502,9 @@ impl AuditModule {
         env.storage()
             .persistent()
             .set(&DataKey::AuditorKey(auditor.clone()), &updated);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditLifecycle(auditor.clone()), &AuditLifecycleStage::Active);
 
         env.events().publish(
             (Symbol::new(&env, "ViewKeyRefreshed"), admin, auditor),
